@@ -1,0 +1,90 @@
+services:
+  redis:
+    image: ${REDIS_IMAGE:?REDIS_IMAGE is required}
+    command:
+      - sh
+      - -c
+      - redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD"
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - redis-cli -a "$$REDIS_PASSWORD" ping | grep -q PONG
+      interval: ${HEALTH_CHECK_INTERVAL:?HEALTH_CHECK_INTERVAL is required}s
+      timeout: ${HEALTH_CHECK_TIMEOUT:?HEALTH_CHECK_TIMEOUT is required}s
+      retries: ${HEALTH_CHECK_RETRIES:?HEALTH_CHECK_RETRIES is required}
+      start_period: ${REDIS_HEALTH_START_PERIOD:?REDIS_HEALTH_START_PERIOD is required}s
+    networks:
+      - app
+    restart: unless-stopped
+    mem_limit: ${REDIS_MEMORY_LIMIT:?REDIS_MEMORY_LIMIT is required}
+    cpus: ${REDIS_CPU_LIMIT:?REDIS_CPU_LIMIT is required}
+
+  api:
+    image: ${API_IMAGE:?API_IMAGE is required}
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    environment:
+      REDIS_HOST: ${REDIS_SERVICE_NAME:?REDIS_SERVICE_NAME is required}
+      REDIS_PORT: ${REDIS_PORT:?REDIS_PORT is required}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+      REDIS_QUEUE_NAME: ${REDIS_QUEUE_NAME:?REDIS_QUEUE_NAME is required}
+      API_HOST: ${API_HOST:?API_HOST is required}
+      API_PORT: ${API_PORT:?API_PORT is required}
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - ${API_PORT:?API_PORT is required}:${API_PORT:?API_PORT is required}
+    networks:
+      - app
+    restart: unless-stopped
+    mem_limit: ${API_MEMORY_LIMIT:?API_MEMORY_LIMIT is required}
+    cpus: ${API_CPU_LIMIT:?API_CPU_LIMIT is required}
+
+  worker:
+    image: ${WORKER_IMAGE:?WORKER_IMAGE is required}
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    environment:
+      REDIS_HOST: ${REDIS_SERVICE_NAME:?REDIS_SERVICE_NAME is required}
+      REDIS_PORT: ${REDIS_PORT:?REDIS_PORT is required}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+      REDIS_QUEUE_NAME: ${REDIS_QUEUE_NAME:?REDIS_QUEUE_NAME is required}
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - app
+    restart: unless-stopped
+    mem_limit: ${WORKER_MEMORY_LIMIT:?WORKER_MEMORY_LIMIT is required}
+    cpus: ${WORKER_CPU_LIMIT:?WORKER_CPU_LIMIT is required}
+
+  frontend:
+    image: ${FRONTEND_IMAGE:?FRONTEND_IMAGE is required}
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    environment:
+      FRONTEND_PORT: ${FRONTEND_PORT:?FRONTEND_PORT is required}
+      API_PORT: ${API_PORT:?API_PORT is required}
+      API_SERVICE_NAME: ${API_SERVICE_NAME:?API_SERVICE_NAME is required}
+      API_TIMEOUT: ${API_TIMEOUT:?API_TIMEOUT is required}
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - ${FRONTEND_PORT:?FRONTEND_PORT is required}:${FRONTEND_PORT:?FRONTEND_PORT is required}
+    networks:
+      - app
+    restart: unless-stopped
+    mem_limit: ${FRONTEND_MEMORY_LIMIT:?FRONTEND_MEMORY_LIMIT is required}
+    cpus: ${FRONTEND_CPU_LIMIT:?FRONTEND_CPU_LIMIT is required}
+
+networks:
+  app:
+    name: ${STACK_NETWORK_NAME:?STACK_NETWORK_NAME is required}
+    internal: true

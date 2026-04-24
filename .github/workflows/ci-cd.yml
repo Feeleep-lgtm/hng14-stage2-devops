@@ -1,0 +1,204 @@
+name: ci-cd
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+
+env:
+  REGISTRY_HOST: localhost:5000
+  IMAGE_NAMESPACE: hng14
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install Python lint dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8
+
+      - name: Lint Python
+        run: flake8 api worker
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install ESLint
+        run: npm install --no-save eslint@9
+
+      - name: Lint JavaScript
+        run: npx eslint frontend/app.js
+
+      - name: Lint Dockerfiles
+        run: |
+          docker run --rm -i hadolint/hadolint < api/Dockerfile
+          docker run --rm -i hadolint/hadolint < worker/Dockerfile
+          docker run --rm -i hadolint/hadolint < frontend/Dockerfile
+
+  test:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r api/requirements.txt -r api/requirements-dev.txt
+
+      - name: Run API unit tests
+        run: pytest api/tests --cov=api --cov-report=xml:coverage.xml --cov-report=html:coverage-html
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            coverage.xml
+            coverage-html
+
+  build:
+    runs-on: ubuntu-latest
+    needs: test
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and push images
+        env:
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          for service in api worker frontend; do
+            image="${REGISTRY_HOST}/${IMAGE_NAMESPACE}/${service}"
+            docker build -t "${image}:${GIT_SHA}" -t "${image}:latest" "./${service}"
+            docker push "${image}:${GIT_SHA}"
+            docker push "${image}:latest"
+          done
+
+      - name: Save built images
+        env:
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p image-artifacts
+          docker save -o image-artifacts/api.tar "${REGISTRY_HOST}/${IMAGE_NAMESPACE}/api:${GIT_SHA}" "${REGISTRY_HOST}/${IMAGE_NAMESPACE}/api:latest"
+          docker save -o image-artifacts/worker.tar "${REGISTRY_HOST}/${IMAGE_NAMESPACE}/worker:${GIT_SHA}" "${REGISTRY_HOST}/${IMAGE_NAMESPACE}/worker:latest"
+          docker save -o image-artifacts/frontend.tar "${REGISTRY_HOST}/${IMAGE_NAMESPACE}/frontend:${GIT_SHA}" "${REGISTRY_HOST}/${IMAGE_NAMESPACE}/frontend:latest"
+
+      - name: Upload image artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-images
+          path: image-artifacts
+
+  security_scan:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+          path: image-artifacts
+
+      - name: Load images
+        run: |
+          docker load -i image-artifacts/api.tar
+          docker load -i image-artifacts/worker.tar
+          docker load -i image-artifacts/frontend.tar
+
+      - uses: aquasecurity/setup-trivy@v0.2.2
+
+      - name: Scan images with Trivy
+        env:
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          set +e
+          mkdir -p trivy-results
+          status=0
+          for service in api worker frontend; do
+            trivy image \
+              --severity CRITICAL \
+              --ignore-unfixed \
+              --format sarif \
+              --output "trivy-results/${service}.sarif" \
+              --exit-code 1 \
+              "${REGISTRY_HOST}/${IMAGE_NAMESPACE}/${service}:${GIT_SHA}" || status=$?
+          done
+          exit "$status"
+
+      - name: Upload Trivy SARIF artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-sarif
+          path: trivy-results
+
+  integration_test:
+    runs-on: ubuntu-latest
+    needs: security_scan
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+          path: image-artifacts
+
+      - name: Load images
+        run: |
+          docker load -i image-artifacts/api.tar
+          docker load -i image-artifacts/worker.tar
+          docker load -i image-artifacts/frontend.tar
+
+      - name: Run integration test
+        env:
+          API_IMAGE: ${{ env.REGISTRY_HOST }}/${{ env.IMAGE_NAMESPACE }}/api:${{ github.sha }}
+          WORKER_IMAGE: ${{ env.REGISTRY_HOST }}/${{ env.IMAGE_NAMESPACE }}/worker:${{ github.sha }}
+          FRONTEND_IMAGE: ${{ env.REGISTRY_HOST }}/${{ env.IMAGE_NAMESPACE }}/frontend:${{ github.sha }}
+          FRONTEND_PORT: 5000
+        run: bash scripts/integration-test.sh
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: integration_test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+          path: image-artifacts
+
+      - name: Load images
+        run: |
+          docker load -i image-artifacts/api.tar
+          docker load -i image-artifacts/worker.tar
+          docker load -i image-artifacts/frontend.tar
+
+      - name: Run rolling deployment
+        env:
+          API_IMAGE: ${{ env.REGISTRY_HOST }}/${{ env.IMAGE_NAMESPACE }}/api:${{ github.sha }}
+          WORKER_IMAGE: ${{ env.REGISTRY_HOST }}/${{ env.IMAGE_NAMESPACE }}/worker:${{ github.sha }}
+          FRONTEND_IMAGE: ${{ env.REGISTRY_HOST }}/${{ env.IMAGE_NAMESPACE }}/frontend:${{ github.sha }}
+        run: bash scripts/deploy.sh
